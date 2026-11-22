@@ -101,8 +101,9 @@ impl Hw {
             (_, true) => 0x30,
             (_, false) => 0x00,
         };
-        // [0xFF, fan mode, 1 = BIOS runs the fan curve (no software loop needed), 0]
-        self.bios.set(OMEN, 0x1A, &[0xFF, fan, 0x01, 0x00])?;
+        // [0xFF, fan mode, BIOS-fan flag, 0]. The flag doesn't give an automatic curve on this
+        // machine (fans hold the last 0x2E level either way); 0 matches OMEN's AC path.
+        self.bios.set(OMEN, 0x1A, &[0xFF, fan, 0x00, 0x00])?;
         let (tgp, boost) = mode.gpu();
         self.bios.set(OMEN, 0x22, &[tgp, boost, 0x01, 0x57])?;
         let w = mode.cpu_watts();
@@ -118,6 +119,20 @@ impl Hw {
 
     pub fn set_max_fan(&self, on: bool) -> Result<()> {
         self.bios.set(OMEN, 0x27, &[on as u8])
+    }
+
+    /// Fixed fan levels (×100 rpm, 0 = stop). Held until the next call.
+    pub fn set_fan_levels(&self, cpu: u8, gpu: u8) -> Result<()> {
+        let mut d = [0u8; 128];
+        d[0] = cpu;
+        d[1] = gpu;
+        self.bios.set(OMEN, 0x2E, &d)
+    }
+
+    /// BIOS fan table rows: (CPU fan level, matching GPU fan level).
+    pub fn fan_pairs(&self) -> Result<Vec<(u8, u8)>> {
+        let d = self.bios.get(OMEN, 0x2F, &[0; 4], 128)?;
+        Ok(d.get(5..).unwrap_or_default().chunks_exact(3).map(|r| (r[0], r[1])).filter(|p| p.0 > 0).collect())
     }
 
     /// Four zone colours as 0xRRGGBB.

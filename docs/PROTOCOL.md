@@ -58,6 +58,21 @@ Graphics mux: `0` hybrid, `1` discrete. Write `[mode,0,0,0]`, applies after rest
 | Balanced | 0x30 | off | on | 55 W |
 | Performance | 0x31 | on | on | 65 W |
 
-In "auto" fans it runs its own software fan curve every second (`SwFanControl`). omenless instead
-passes `biosFanControl = 1`, the path HP uses itself on battery/eco, so the BIOS fan table runs
-and no software loop is needed.
+## Fans need software
+
+Tested on hardware: there is no BIOS auto curve. Fans hold the last `0x2E` level (3000 rpm stayed
+3000 under 100 % CPU; after OMEN was killed they stayed at 0 rpm under load). The `biosFanControl`
+byte and `0x2E [255,255]` change nothing. A `0x1A` mode write resets the level to 0.
+
+OMEN runs `SwFanControl` every second from its driver's CPU temperature. omenless runs the same
+kind of loop every 2 s with driverless inputs:
+
+- CPU: ACPI zone `\_TZ.TSZ0` via the `Thermal Zone Information` perf counter (idle ~42 °C,
+  60–70 °C under load).
+- GPU: `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERPERFDATA)`, the Task Manager source; matches
+  `nvidia-smi` and doesn't wake a sleeping dGPU.
+
+`0x2F` table rows are `(cpu level, gpu level, unused)`; OMEN drives the GPU fan with the row that
+matches the CPU level. Auto uses HP's own step tables from `Bigred_PHX_N21X2X4X6.json`
+(balanced/eco and performance). Safety: CPU ≥ 92 °C or GPU ≥ 87 °C → 5800 rpm; no readings →
+3000 rpm; quitting leaves 3000 rpm.

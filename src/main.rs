@@ -3,7 +3,10 @@
 //! Performance mode, max fans, keyboard light, GPU mux, OMEN key. No telemetry, no services.
 
 mod bios;
+mod curve;
+mod fan;
 mod hw;
+mod sensors;
 mod sys;
 
 use std::cell::RefCell;
@@ -24,6 +27,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINF
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use fan::{FanLoop, FanMode, SAFE_LEVEL};
 use hw::{Gpu, Hw, Mode};
 use sys::{wide, Config};
 
@@ -32,10 +36,13 @@ const WM_OMEN_KEY: u32 = WM_APP + 2;
 
 const TIMER_IDLE: usize = 1;
 const TIMER_REAPPLY: usize = 2;
+const TIMER_FAN: usize = 3;
+const FAN_TICK_MS: u32 = 2000;
 const IDLE_AFTER_MS: u32 = 120_000;
 
 const ID_MODE: u32 = 100; // + Mode as u32
-const ID_MAX_FAN: u32 = 110;
+const ID_FAN: u32 = 110; // + FanMode as u32
+const ID_FAN_EDIT: u32 = 113;
 const ID_KB_ON: u32 = 120;
 const ID_KB_IDLE: u32 = 121;
 const ID_KB_CUSTOM: u32 = 122;
@@ -59,6 +66,7 @@ const PRESETS: [(&str, [u32; 4]); 9] = [
 
 struct App {
     hw: Hw,
+    fan: FanLoop,
     cfg: Config,
     hwnd: HWND,
     icon: HICON,
@@ -120,9 +128,12 @@ fn main() {
         let _ = RegisterPowerSettingNotification(HANDLE(hwnd.0), &GUID_ACDC_POWER_SOURCE, DEVICE_NOTIFY_WINDOW_HANDLE);
 
         let cfg = Config::load();
-        let app = App { icon: sys::mode_icon(cfg.mode), hw, cfg, hwnd, dimmed: false, autostart: sys::autostart_enabled() };
-        apply_all(&app);
+        let fan = FanLoop::new(&hw);
+        let mut app = App { icon: sys::mode_icon(cfg.mode), hw, fan, cfg, hwnd, dimmed: false, autostart: sys::autostart_enabled() };
+        apply_all(&mut app);
+        app.fan.tick(&app.hw, app.cfg.mode, app.cfg.fans, &app.cfg.curve);
         tray(&app, NIM_ADD);
+        SetTimer(Some(hwnd), TIMER_FAN, FAN_TICK_MS, None);
         if app.cfg.idle_off {
             SetTimer(Some(hwnd), TIMER_IDLE, 5000, None);
         }
@@ -168,14 +179,36 @@ fn self_test(hw: &Hw, cfg: &Config) -> String {
     wait(1000);
     line(format!("  -> fans {:?}", hw.fan_rpm()));
     line(format!("final apply {} {:?}", cfg.mode.name(), hw.apply_mode(cfg.mode).map_err(|e| e.message())));
+    let mut fl = FanLoop::new(hw);
+    line(format!("fan table pairs: {}", fl.gpu_level(30)));
+    for fm in [FanMode::Auto, FanMode::Custom] {
+        fl.force();
+        for _ in 0..3 {
+            fl.tick(hw, cfg.mode, fm, &cfg.curve);
+            wait(FAN_TICK_MS as u64);
+            line(format!("{:<12} cpu {:?} gpu {:?} -> level {:?} | fans {:?}", fm.name(), fl.cpu, fl.gpu, fl.level, hw.fan_rpm()));
+        }
+    }
     sys::set_power_overlay(cfg.mode);
     out
 }
 
-fn apply_all(app: &App) {
+fn apply_all(app: &mut App) {
     let _ = app.hw.apply_mode(app.cfg.mode);
-    let _ = app.hw.set_max_fan(app.cfg.max_fan);
+    let _ = app.hw.set_max_fan(app.cfg.fans == FanMode::Max);
     sys::set_power_overlay(app.cfg.mode);
+    app.fan.force();
+}
+
+fn set_fans(app: &mut App, fans: FanMode) {
+    if fans != app.cfg.fans {
+        report("Fans", app.hw.set_max_fan(fans == FanMode::Max));
+    }
+    app.cfg.fans = fans;
+    app.cfg.save();
+    app.fan.force();
+    app.fan.tick(&app.hw, app.cfg.mode, app.cfg.fans, &app.cfg.curve);
+    tray(app, NIM_MODIFY);
 }
 
 fn tray(app: &App, op: NOTIFY_ICON_MESSAGE) {
@@ -188,7 +221,7 @@ fn tray(app: &App, op: NOTIFY_ICON_MESSAGE) {
         hIcon: app.icon,
         ..Default::default()
     };
-    let tip = format!("{}{}", app.cfg.mode.name(), if app.cfg.max_fan { " · max fans" } else { "" });
+    let tip = format!("{} · {} fans", app.cfg.mode.name(), app.cfg.fans.name().to_lowercase());
     for (d, s) in nid.szTip.iter_mut().zip(tip.encode_utf16().take(127)) {
         *d = s;
     }
@@ -202,6 +235,9 @@ fn set_mode(app: &mut App, mode: Mode) {
     app.cfg.save();
     report("Setting mode", app.hw.apply_mode(mode));
     sys::set_power_overlay(mode);
+    // The BIOS drops the fan level to 0 on a mode change: re-send right away.
+    app.fan.force();
+    app.fan.tick(&app.hw, app.cfg.mode, app.cfg.fans, &app.cfg.curve);
     let old = app.icon;
     app.icon = sys::mode_icon(mode);
     tray(app, NIM_MODIFY);
@@ -215,7 +251,8 @@ fn set_mode(app: &mut App, mode: Mode) {
 struct MenuState {
     mode: Mode,
     rpm: Vec<u32>,
-    max_fan: bool,
+    temps: (Option<f32>, Option<f32>),
+    fans: FanMode,
     kb_on: bool,
     kb: [u32; 4],
     idle_off: bool,
@@ -253,15 +290,32 @@ fn submenu(menu: HMENU, sub: HMENU, text: &str) {
 fn build_menu(s: &MenuState) -> windows::core::Result<HMENU> {
     unsafe {
         let m = CreatePopupMenu()?;
-        let fans = if s.rpm.is_empty() { "Fans —".to_string() } else { format!("Fans  {} rpm", s.rpm.iter().map(u32::to_string).collect::<Vec<_>>().join(" · ")) };
-        add(m, 0, &fans, false, false);
+        let mut status = Vec::new();
+        if let Some(c) = s.temps.0 {
+            status.push(format!("CPU {c:.0}°"));
+        }
+        if let Some(g) = s.temps.1 {
+            status.push(format!("GPU {g:.0}°"));
+        }
+        if !s.rpm.is_empty() {
+            status.push(format!("{} rpm", s.rpm.iter().map(u32::to_string).collect::<Vec<_>>().join(" / ")));
+        }
+        add(m, 0, &status.join("  ·  "), false, false);
         sep(m);
         for mode in Mode::ALL {
             add(m, ID_MODE + mode.as_u32(), mode.name(), false, true);
         }
         let _ = CheckMenuRadioItem(m, ID_MODE, ID_MODE + 2, ID_MODE + s.mode.as_u32(), MF_BYCOMMAND.0);
         sep(m);
-        add(m, ID_MAX_FAN, "Max fans", s.max_fan, true);
+
+        let f = CreatePopupMenu()?;
+        for fm in [FanMode::Auto, FanMode::Custom, FanMode::Max] {
+            add(f, ID_FAN + fm as u32, fm.name(), false, true);
+        }
+        let _ = CheckMenuRadioItem(f, ID_FAN, ID_FAN + 2, ID_FAN + s.fans as u32, MF_BYCOMMAND.0);
+        sep(f);
+        add(f, ID_FAN_EDIT, "Edit curve…", false, true);
+        submenu(m, f, &format!("Fans: {}", s.fans.name()));
 
         let kb = CreatePopupMenu()?;
         add(kb, ID_KB_ON, "Backlight", s.kb_on, true);
@@ -292,8 +346,8 @@ fn show_menu(hwnd: HWND) {
     let Some(state) = with_app(|a| MenuState {
         mode: a.cfg.mode,
         rpm: a.hw.fan_rpm().unwrap_or_default(),
-        // The BIOS max-fan getter reads 0 even while it is on, so trust our own setting.
-        max_fan: a.cfg.max_fan,
+        temps: (a.fan.cpu, a.fan.gpu),
+        fans: a.cfg.fans,
         kb_on: a.hw.kb_on().unwrap_or(false),
         kb: a.hw.kb_colors().unwrap_or_default(),
         idle_off: a.cfg.idle_off,
@@ -321,13 +375,16 @@ fn command(hwnd: HWND, id: u32, s: &MenuState) {
         _ if (ID_MODE..ID_MODE + 3).contains(&id) => {
             with_app(|a| set_mode(a, Mode::from_u32(id - ID_MODE)));
         }
-        ID_MAX_FAN => {
-            with_app(|a| {
-                a.cfg.max_fan = !a.cfg.max_fan;
-                a.cfg.save();
-                report("Max fans", a.hw.set_max_fan(a.cfg.max_fan));
-                tray(a, NIM_MODIFY);
-            });
+        _ if (ID_FAN..ID_FAN + 3).contains(&id) => {
+            with_app(|a| set_fans(a, FanMode::from_u32(id - ID_FAN)));
+        }
+        ID_FAN_EDIT => {
+            if let Some(c) = with_app(|a| {
+                set_fans(a, FanMode::Custom);
+                a.cfg.curve
+            }) {
+                curve::open(c);
+            }
         }
         ID_KB_ON => {
             with_app(|a| report("Keyboard backlight", a.hw.set_kb_on(!s.kb_on)));
@@ -378,7 +435,13 @@ fn command(hwnd: HWND, id: u32, s: &MenuState) {
             }
         }
         ID_QUIT => unsafe {
-            with_app(|a| tray(a, NIM_DELETE));
+            with_app(|a| {
+                // Nothing drives the fans once we're gone, so don't leave them stopped.
+                if a.cfg.fans != FanMode::Max {
+                    let _ = a.hw.set_fan_levels(SAFE_LEVEL, a.fan.gpu_level(SAFE_LEVEL));
+                }
+                tray(a, NIM_DELETE);
+            });
             PostQuitMessage(0);
         },
         _ => {}
@@ -484,9 +547,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                 LRESULT(0)
             }
             WM_TIMER => {
-                if wp.0 == TIMER_REAPPLY {
+                if wp.0 == TIMER_FAN {
+                    with_app(|a| a.fan.tick(&a.hw, a.cfg.mode, a.cfg.fans, &a.cfg.curve));
+                    curve::refresh();
+                } else if wp.0 == TIMER_REAPPLY {
                     let _ = KillTimer(Some(hwnd), TIMER_REAPPLY);
-                    with_app(|a| apply_all(a));
+                    with_app(apply_all);
                 } else if wp.0 == TIMER_IDLE {
                     with_app(idle_tick);
                 }

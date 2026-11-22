@@ -5,7 +5,9 @@ telemetry, no polling while idle.
 
 - Modes: Eco, Balanced, Performance (fan mode, NVIDIA cTGP + Dynamic Boost, CPU power limit,
   Windows power slider)
-- Max fans
+- Fans: Auto (HP's own curves per mode), Custom curve (drag-the-points editor with live CPU/GPU
+  temps), Max. This laptop has no BIOS fan curve, so omenless runs the loop itself every 2 s
+  from driverless sensors.
 - Keyboard: 4-zone colour presets, custom colour, backlight on/off, off when idle
 - Graphics: Hybrid / Discrete only (restart)
 - OMEN key cycles Balanced → Performance → Eco
@@ -26,5 +28,8 @@ interface but may differ; see [docs/PROTOCOL.md](docs/PROTOCOL.md).
 Builds, copies to `C:\Program Files\omenless` (admin-only folder, since it runs elevated) and
 starts it. Then tick **Start with Windows** in the menu.
 
-`omenless.exe --test out.txt` runs a hardware self-test (cycles modes, flashes the keyboard,
-max fans for 6 s) and writes the read-backs to `out.txt`.
+`./scripts/install.ps1 -Test report.txt` (or `omenless.exe --test report.txt`) runs a hardware
+self-test first: cycles modes, flashes the keyboard, max fans for 6 s, runs the fan loop, and
+writes the read-backs to the file. `cargo test` covers the curve math.
+
+Don't run OMEN Gaming Hub at the same time: both drive the fans.

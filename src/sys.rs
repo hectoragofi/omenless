@@ -9,6 +9,7 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Registry::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::fan::{Curve, FanMode, DEFAULT_CURVE};
 use crate::hw::Mode;
 
 const KEY: PCWSTR = w!("Software\\omenless");
@@ -23,8 +24,30 @@ pub fn wide(s: &str) -> Vec<u16> {
 
 pub struct Config {
     pub mode: Mode,
-    pub max_fan: bool,
+    pub fans: FanMode,
+    pub curve: Curve,
     pub idle_off: bool,
+}
+
+fn reg_get_curve() -> Option<Curve> {
+    let mut buf = [0u8; 12];
+    let mut size = 12u32;
+    let err = unsafe { RegGetValueW(HKEY_CURRENT_USER, KEY, w!("Curve"), RRF_RT_REG_BINARY, None, Some(buf.as_mut_ptr() as _), Some(&mut size)) };
+    if err != ERROR_SUCCESS || size != 12 {
+        return None;
+    }
+    let mut c = DEFAULT_CURVE;
+    for (i, p) in c.iter_mut().enumerate() {
+        *p = (buf[i * 2], buf[i * 2 + 1]);
+    }
+    Some(c)
+}
+
+fn reg_set_curve(c: &Curve) {
+    let buf: Vec<u8> = c.iter().flat_map(|&(t, l)| [t, l]).collect();
+    unsafe {
+        let _ = RegSetKeyValueW(HKEY_CURRENT_USER, KEY, w!("Curve"), REG_BINARY.0, Some(buf.as_ptr() as _), buf.len() as u32);
+    }
 }
 
 fn reg_get(name: &str) -> Option<u32> {
@@ -48,25 +71,27 @@ impl Config {
     pub fn load() -> Self {
         Self {
             mode: Mode::from_u32(reg_get("Mode").unwrap_or(1)),
-            max_fan: reg_get("MaxFan") == Some(1),
+            fans: FanMode::from_u32(reg_get("FanMode").unwrap_or(0)),
+            curve: reg_get_curve().unwrap_or(DEFAULT_CURVE),
             idle_off: reg_get("IdleOff") == Some(1),
         }
     }
     pub fn save(&self) {
         reg_set("Mode", self.mode.as_u32());
-        reg_set("MaxFan", self.max_fan as u32);
+        reg_set("FanMode", self.fans as u32);
         reg_set("IdleOff", self.idle_off as u32);
+        reg_set_curve(&self.curve);
     }
 }
 
-pub fn light_taskbar() -> bool {
+fn theme_flag(name: PCWSTR) -> bool {
     let mut v = 0u32;
     let mut size = 4u32;
     let err = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
             w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-            w!("SystemUsesLightTheme"),
+            name,
             RRF_RT_REG_DWORD,
             None,
             Some(&mut v as *mut u32 as _),
@@ -74,6 +99,14 @@ pub fn light_taskbar() -> bool {
         )
     };
     err == ERROR_SUCCESS && v == 1
+}
+
+pub fn light_taskbar() -> bool {
+    theme_flag(w!("SystemUsesLightTheme"))
+}
+
+pub fn light_apps() -> bool {
+    theme_flag(w!("AppsUseLightTheme"))
 }
 
 // ---------- start with Windows (elevated logon task, no UAC prompt) ----------
