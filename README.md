@@ -37,7 +37,17 @@ Gaming Hub set one every second. With OMEN stopped and nothing else running, the
 - If omenless isn't running at all (not started, crashed), nothing drives the fans. Keep
   **Start with Windows** on.
 
-## Install
+## Download
+
+1. Get `omenless.exe` from [Releases](https://github.com/hectoragofi/omenless/releases/latest).
+2. Quit or uninstall OMEN Gaming Hub (see below); both drive the fans.
+3. Run it. Windows SmartScreen may warn because the exe isn't signed: **More info → Run anyway**.
+   It asks for admin, because the BIOS interface needs it.
+4. On a laptop other than the Victus 16-s0 (board 8BD4) it warns first. Say no if unsure.
+5. Right-click the tray icon → **Start with Windows**. This copies it to
+   `C:\Program Files\omenless` and starts it at every logon without a UAC prompt.
+
+## Build from source
 
 ```powershell
 ./scripts/install.ps1
