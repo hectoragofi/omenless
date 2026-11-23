@@ -101,6 +101,29 @@ fn theme_flag(name: PCWSTR) -> bool {
     err == ERROR_SUCCESS && v == 1
 }
 
+fn reg_str(root: HKEY, key: PCWSTR, name: PCWSTR) -> Option<String> {
+    let mut buf = [0u16; 128];
+    let mut size = (buf.len() * 2) as u32;
+    let err = unsafe { RegGetValueW(root, key, name, RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as _), Some(&mut size)) };
+    (err == ERROR_SUCCESS).then(|| String::from_utf16_lossy(&buf[..(size as usize / 2).saturating_sub(1)]))
+}
+
+/// Motherboard id, e.g. "8BD4" for the Victus 16-s0 this was built on.
+pub fn board() -> String {
+    reg_str(HKEY_LOCAL_MACHINE, w!("HARDWARE\\DESCRIPTION\\System\\BIOS"), w!("BaseBoardProduct")).unwrap_or_default()
+}
+
+pub fn accepted_board() -> Option<String> {
+    reg_str(HKEY_CURRENT_USER, KEY, w!("AcceptedBoard"))
+}
+
+pub fn accept_board(board: &str) {
+    let v = wide(board);
+    unsafe {
+        let _ = RegSetKeyValueW(HKEY_CURRENT_USER, KEY, w!("AcceptedBoard"), REG_SZ.0, Some(v.as_ptr() as _), (v.len() * 2) as u32);
+    }
+}
+
 pub fn light_taskbar() -> bool {
     theme_flag(w!("SystemUsesLightTheme"))
 }
@@ -127,7 +150,16 @@ pub fn set_autostart(on: bool) -> bool {
             .status()
             .is_ok_and(|s| s.success());
     }
-    let Ok(exe) = std::env::current_exe() else { return false };
+    // An elevated logon task must point at an admin-only folder, or anything that can write to
+    // e.g. Downloads could swap the exe and get admin. Copy ourselves to Program Files first.
+    let Ok(current) = std::env::current_exe() else { return false };
+    let exe = std::path::PathBuf::from(std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into())).join("omenless").join("omenless.exe");
+    if current.to_string_lossy().to_lowercase() != exe.to_string_lossy().to_lowercase() {
+        let copied = exe.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok()) && std::fs::copy(&current, &exe).is_ok();
+        if !copied {
+            return false;
+        }
+    }
     let user = format!("{}\\{}", std::env::var("USERDOMAIN").unwrap_or_default(), std::env::var("USERNAME").unwrap_or_default());
     let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
     let xml = format!(

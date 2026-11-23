@@ -39,6 +39,7 @@ const TIMER_REAPPLY: usize = 2;
 const TIMER_FAN: usize = 3;
 const FAN_TICK_MS: u32 = 2000;
 const IDLE_AFTER_MS: u32 = 120_000;
+const TESTED_BOARD: &str = "8BD4";
 
 const ID_MODE: u32 = 100; // + Mode as u32
 const ID_FAN: u32 = 110; // + FanMode as u32
@@ -103,6 +104,20 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let _ = CoInitializeSecurity(None, -1, None, None, RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE, None, EOAC_NONE, None);
+
+        let board = sys::board();
+        if board != TESTED_BOARD && sys::accepted_board().as_deref() != Some(board.as_str()) {
+            let text = wide(&format!(
+                "omenless was built and tested on the HP Victus 16-s0 (board {TESTED_BOARD}). This laptop's board is {}.\n\n\
+                 Fan curves, power limits and sensors may not match this model, and omenless takes over fan control.\n\n\
+                 Use it anyway?",
+                if board.is_empty() { "unknown" } else { &board }
+            ));
+            if MessageBoxW(None, PCWSTR(text.as_ptr()), w!("omenless"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND) != IDYES {
+                return;
+            }
+            sys::accept_board(&board);
+        }
 
         let hw = match Hw::new() {
             Ok(h) => h,
